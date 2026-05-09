@@ -1,0 +1,651 @@
+/* ------ CS259 Formal Languages Coursework ---------- */
+options {
+  STATIC = false; // allows multiple parser instances
+}
+
+PARSER_BEGIN(TPTP)
+
+import java.util.*;
+
+public class TPTP {
+  // Task 1 Parsing Data & Handling Errors
+
+  // Tables for semantic context checking, and some further conditions checking
+  Map<String, Token> stepNames = new LinkedHashMap<>(); // Tracks steps description and ensure top down order
+  Map<String, Token> parameterNames = new HashMap<>(); // Tracks variables that are used as parameters
+  List<Token> stepReferences = new ArrayList<>(); // Tracks all references to nstep(next step) and estep(else step)
+
+  // For main execution captured by "run" instruction
+  String runTarget = null;
+  int runLine = 0;
+  long runNum1 = 0; // x coordinate
+  long runNum2 = 0; // y coordinate
+
+  // For error reporting customization in detailed
+  String errorContext = "parsing program";
+
+  // Error handling when input is not a TPTP program.
+  // Ensure the rule of just "Failure", the line number, and the violation message
+  static void fail(int line, String message) {
+    System.out.println("Failure");
+    System.err.println(line);
+    System.err.println(message);
+    System.exit(1);
+  }
+
+  // Token dictionary for readable error messages
+  static final Map<Integer, String> TOKEN_NAMES = new HashMap<>();
+  static {
+    TOKEN_NAMES.put(EOF, "end of input");
+    TOKEN_NAMES.put(IF, "keyword 'if'");
+    TOKEN_NAMES.put(BECOMES, "keyword 'becomes'");
+    TOKEN_NAMES.put(AND, "keyword 'and'");
+    TOKEN_NAMES.put(ELSE, "keyword 'else'");
+    TOKEN_NAMES.put(RUN, "keyword 'run'");
+    TOKEN_NAMES.put(SEMICOLON, "';'");
+    TOKEN_NAMES.put(COLON, "':'");
+    TOKEN_NAMES.put(COMMA, "','");
+    TOKEN_NAMES.put(LPAREN, "'('");
+    TOKEN_NAMES.put(RPAREN, "')'");
+    TOKEN_NAMES.put(LT, "'<'");
+    TOKEN_NAMES.put(PLUS, "'+'");
+    TOKEN_NAMES.put(MINUS, "'-'");
+    TOKEN_NAMES.put(TIMES, "'*'");
+    TOKEN_NAMES.put(ID, "identifier");
+    TOKEN_NAMES.put(NUM, "numeral");
+  }
+
+  // Converts tokens into readable names for error messages
+  static String tokenDescription(Token tok) {
+    String base = TOKEN_NAMES.get(tok.kind);
+
+    // error case if token not in dict
+    if (base == null) {
+        return "'" + tok.image + "'"; }
+
+    // identify specifically the error
+    if (tok.kind == ID || tok.kind == NUM) {
+        return base + " '" + tok.image + "'"; }
+
+    return base;
+  }
+
+  // Task 2 Abstract Syntax Tree Definitions
+
+  // Base class for all mathematical expressions
+  static abstract class Expr {
+      abstract long evaluate(long v1, long v2, String i1, String i2);
+      abstract boolean hasMultiply(); // multiply operation
+      abstract boolean hasAnySub(); // subtract operation
+      abstract boolean hasInvalidSub();
+
+      boolean isPositiveLinear() {
+          return !hasMultiply() && !hasInvalidSub();
+      }
+  }
+
+  // Represents a raw number (e.g. 1, 50, 201)
+  static class NumExpr extends Expr {
+      long val;
+      NumExpr(long v) {
+          val = v;
+      }
+      // Returns its own number when asked to calculate
+      long evaluate(long v1, long v2, String i1, String i2) {
+          return val;
+      }
+      // A raw number dont have any math operators, so all return false
+      boolean hasMultiply() {
+          return false;
+      }
+      boolean hasAnySub() {
+          return false;
+      }
+      boolean hasInvalidSub() {
+          return false;
+      }
+  }
+
+  // Represents a variable or parameter name (eg. x or y)
+  static class VarExpr extends Expr {
+      String name;
+      VarExpr(String n) {
+          name = n;
+      }
+
+      // Checks if the var matches the first or second parameter and return the matching value separately
+      long evaluate(long v1, long v2, String i1, String i2) {
+          if (name.equals(i1)) {
+              return v1; // For i1 return v1
+          }
+          if (name.equals(i2)) {
+              return v2; // For i2 return v2
+          }
+          throw new RuntimeException("Unknown variable: " + name);
+      }
+
+      // A variable itself dont have any math operators, so all false
+      boolean hasMultiply() {
+          return false;
+      }
+      boolean hasAnySub() {
+          return false;
+      }
+      boolean hasInvalidSub() {
+          return false;
+      }
+  }
+
+  // Represents a math operation with two sides (e.g. x+2 or y-4). Left and right can be either variables or numbers
+  static class BinOpExpr extends Expr {
+      char op;
+      Expr left, right;
+
+      BinOpExpr(char o, Expr l, Expr r) {
+          op = o; left = l; right = r;
+      }
+
+      // Calculate left and right side respectively and combine them through provided math ops
+      long evaluate(long v1, long v2, String i1, String i2) {
+          long leftValue = left.evaluate(v1, v2, i1, i2);
+          long rightValue = right.evaluate(v1, v2, i1, i2);
+          if (op == '+') {
+              return leftValue + rightValue;
+          }
+          if (op == '-') {
+              return leftValue - rightValue;
+          }
+          if (op == '*'){
+              return leftValue * rightValue;
+          }
+          throw new RuntimeException("Unknown operator: " + op);
+      }
+
+      // Rule S1. Check if this operator or left/right is a multiplication '*'
+      boolean hasMultiply() {
+          return op == '*' || left.hasMultiply() || right.hasMultiply();
+      }
+      // Rule S2. Check if there is any subtraction
+      boolean hasAnySub() {
+          return op == '-' || left.hasAnySub() || right.hasAnySub();
+      }
+      // Rule S2. Check if there is unallowed subtraction
+      boolean hasInvalidSub() {
+          // If the operator is a minus, the right side must be a number. Cannot be variable
+          if (op == '-' && !(right instanceof NumExpr)) {
+              return true;
+          }
+          // Recursively check if there is any invalid subtraction on both sides
+          return left.hasInvalidSub() || right.hasInvalidSub();
+      }
+  }
+
+  // Task 2. Execution interpreter
+
+  // Data container that represents a single parsed TPTP step instruction
+  static class StepData {
+      String stepName; // e.g. step_1
+
+      // Name of parameters
+      String id1, id2; // X & Y coordinate name of the current location of the robot
+
+      // Condition
+      String conditionVariable;
+      long conditionThreshold;
+
+      // True branch
+      Expr e1, e2; // math expression if true
+      String NSTEP;
+
+      // False branch
+      Expr e3, e4; // math expression if false
+      String ESTEP;
+  }
+
+  // The key memory table holding all parsed and validated steps
+  Map<String, StepData> stepMemory = new LinkedHashMap<>();
+
+  // Audits a step to ensure it complies with rules S1, S2, and S3
+  boolean auditSimpleRules(StepData step) {
+      // Group expressions for easier S1,S2,S3 checking
+      Expr[] allExprs = {step.e1, step.e2, step.e3, step.e4};
+      Expr[] trueBranchExprs = {step.e1, step.e2};
+      Expr[] falseBranchExprs = {step.e3, step.e4};
+
+    // S1: Positive linear check on all expressions. Multiplication and invalid subtraction are checked
+    for (Expr e : allExprs) {
+        if (e != null && !e.isPositiveLinear()) {
+            return false;
+        }
+    }
+
+    // S2: No subtraction allowed in the True Branch
+    for (Expr e : trueBranchExprs) {
+        if (e != null && e.hasAnySub()) {
+            return false;
+        }
+    }
+
+    // S3: If condition is false, result coordinates cannot be negative
+    // Since we are not running the live simulation yet, we create a fake worst case scenario
+    long minConditionVariable = Math.max(0, step.conditionThreshold);
+    long minOtherVariable = 0;
+
+    long testId1 = step.conditionVariable.equals(step.id1) ? minConditionVariable : minOtherVariable;
+    long testId2 = step.conditionVariable.equals(step.id2) ? minConditionVariable : minOtherVariable;
+
+    for (Expr e : falseBranchExprs) {
+        if (e != null && e.evaluate(testId1, testId2, step.id1, step.id2) < 0) {
+            return false;
+        }
+    }
+      return true; // Pass all audits!!
+  }
+
+  // Main interpreter that executes the TPTP program and loop with loop detection
+  void executeInterpreter() {
+      String currentStepName = runTarget;
+      long currentX = runNum1;
+      long currentY = runNum2;
+
+      // Detect any loops if state (step, x, y) is repeated
+      Set<String> visited = new HashSet<>();
+
+      while (true) {
+          // 1. Halt check - Does the target step actually exist?
+          // Print coordinates and end if no
+          if (!stepMemory.containsKey(currentStepName)) {
+              System.out.println(currentStepName + " " + currentX + " " + currentY);
+              return;
+          }
+
+          // 2. Loop detection if a step is repeated
+          String state = currentStepName + ',' + currentX + ',' + currentY;
+          if (visited.contains(state)) {
+              System.out.println("Loop");
+              return;
+          }
+          visited.add(state);
+
+          // 3. Execute current step and evaluate expressions before updating coordinates
+          StepData step = stepMemory.get(currentStepName);
+          long coordinateValue = step.conditionVariable.equals(step.id1) ? currentX : currentY;
+          boolean isConditionTrue = coordinateValue < step.conditionThreshold;
+
+          long newX, newY;
+          if (isConditionTrue) {
+              newX = step.e1 != null ? step.e1.evaluate(currentX, currentY, step.id1, step.id2) : currentX;
+              newY = step.e2 != null ? step.e2.evaluate(currentX, currentY, step.id1, step.id2) : currentY;
+              currentStepName = step.NSTEP;
+          } else {
+              newX = step.e3 != null ? step.e3.evaluate(currentX, currentY, step.id1, step.id2) : currentX;
+              newY = step.e4 != null ? step.e4.evaluate(currentX, currentY, step.id1, step.id2) : currentY;
+              currentStepName = step.ESTEP;
+          }
+          currentX = newX;
+          currentY = newY;
+      }
+  }
+
+  // Main compiler entry point
+  public static void main(String[] args) {
+    TPTP parser = new TPTP(System.in);
+    try {
+
+      // Run the parser
+      parser.program();
+
+      // FC10: the step named by run must exist
+      if (!parser.stepNames.containsKey(parser.runTarget)) {
+        fail(parser.runLine, "Step '" + parser.runTarget + "' referenced by run instruction does not exist.");
+      }
+
+      // FC5: a parameter name cannot also be used as a step name
+      // We need strict messages, a word cannot be both a math variable and a step name
+      for (Map.Entry<String, Token> entry : parser.parameterNames.entrySet()) {
+        String param = entry.getKey();
+        Token  paramTok = entry.getValue();
+
+        // Check parameter name matches a defined step name
+        if (parser.stepNames.containsKey(param)) {
+          fail(paramTok.beginLine, "Identifier '" + param + "' is used as both a parameter name and a step name.");
+        }
+
+        // Check parameter name matches the run target
+        if (param.equals(parser.runTarget)) {
+          fail(paramTok.beginLine, "Identifier '" + param + "' is used as both a parameter name and the run target step name.");
+        }
+
+        // Check parameter name matches any NSTEP or ESTEP reference
+        for (Token ref : parser.stepReferences) {
+          if (ref.image.equals(param)) {
+            fail(paramTok.beginLine, "Identifier '" + param + "' is used as both a parameter name and a step reference.");
+          }
+        }
+      }
+    // All FC checks passed. Good valid TPTP program
+    System.out.println("Success");
+
+    // Before the robot is allowed to move, we need to check every single step is good to run
+    // Audit the stepMemory in order top to bottom step by step
+    String firstNonSimple = null;
+    for (StepData sd : parser.stepMemory.values()) {
+        if (!parser.auditSimpleRules(sd)) {
+            firstNonSimple = sd.stepName;
+            break;
+        }
+    }
+
+    // Execute or reject the robot teleportation program
+    if (firstNonSimple != null) {
+        System.out.println("Non-simple");
+        System.out.println(firstNonSimple);
+    } else {
+        System.out.println("Simple");
+        parser.executeInterpreter();
+    }
+
+    } catch (ParseException e) {
+        // Expected one token but found another
+        // Use errorContext to describe what was expected, and tokenDescription() for what was found
+        Token bad = e.currentToken.next;
+        int line = bad.beginLine;
+        fail(line, "Syntax error: found " + tokenDescription(bad) + " but " + parser.errorContext + ".");
+
+    } catch (TokenMgrError e) {
+        // Lexer hit a character not in any token definition
+        // User typed a character that dont exist in the language
+        String raw = e.getMessage();
+        int line = 1;
+        try {
+            int idx = raw.indexOf("line ");
+            int end = raw.indexOf(",", idx);
+            line = Integer.parseInt(raw.substring(idx + 5, end).trim());
+        } catch (Exception ignored) {}
+        fail(line, "Illegal character in input.");
+    }
+  }
+}
+
+PARSER_END(TPTP)
+
+// Lexer section for Task 1
+
+// Ignore whitespace or newlines between tokens
+SKIP : {
+    " "
+  | "\t"
+  | "\r\n"
+  | "\n"
+  | "\r"
+}
+
+// Reserved words in the TPTP language
+TOKEN : {
+    < IF : "if" >
+  | < BECOMES : "becomes" >
+  | < AND : "and" >
+  | < ELSE : "else" >
+  | < RUN : "run" >
+
+// Variable and step names
+  | < ID : ["a"-"z","A"-"Z"]
+         (["a"-"z","A"-"Z","0"-"9","_"])* >
+
+// Positive integer digits
+  | < NUM : (["0"-"9"])+ >
+
+// Operators and delimiters
+  | < COLON : ":" >
+  | < COMMA : "," >
+  | < LT : "<" >
+  | < LPAREN : "(" >
+  | < RPAREN : ")" >
+  | < PLUS : "+" >
+  | < MINUS : "-" >
+  | < TIMES : "*" >
+  | < SEMICOLON : ";" >
+}
+
+// Grammar rules and parser (Task 1)
+// FC1: one or more step instructions each followed by ";", then run
+void program() : {}
+{
+  { errorContext = "expected a step instruction at start of program"; }
+  step()
+
+  { errorContext = "expected ';' after step instruction"; }
+  <SEMICOLON>
+
+  (
+    LOOKAHEAD(2)  // peek 2 tokens if next is ID followed by ":", it's a step
+    {errorContext = "expected a step instruction or 'run'"; }
+    step()
+    { errorContext = "expected ';' after step instruction"; }
+    <SEMICOLON>
+  )*
+  { errorContext = "expected 'run' instruction after all steps"; }
+  run()
+
+  { errorContext = "expected end of program after run instruction (no semicolon allowed)"; }
+  <EOF>
+}
+
+// run - captures the entry point for the execution engine.
+void run() : { Token stepTok, num1Tok, num2Tok; }
+{
+  <RUN>
+  { errorContext = "expected a step name after 'run'"; }
+  stepTok = <ID>
+
+  { errorContext = "expected '(' after step name '" + stepTok.image + "' in run instruction"; }
+  <LPAREN>
+
+  { errorContext = "expected a number as first coordinate in run instruction"; }
+  num1Tok = <NUM>
+
+  { errorContext = "expected ',' between coordinates in run instruction"; }
+  <COMMA>
+
+  { errorContext = "expected a number as second coordinate in run instruction"; }
+  num2Tok = <NUM>
+
+  { errorContext = "expected ')' to close run instruction"; }
+  <RPAREN>
+  {
+    // Save run details for FC10 check and interpreter starting point
+    runTarget = stepTok.image;
+    runLine = stepTok.beginLine;
+    runNum1 = Long.parseLong(num1Tok.image);
+    runNum2 = Long.parseLong(num2Tok.image);
+  }
+}
+
+// step - core instruction block that performs immediate constraint checking
+// STEP ":" "if" COND "(" ID1 "," ID2 ")" body
+void step() : { Token nameTok, conditionTok, id1Tok, id2Tok; StepData stepObj = new StepData(); }
+{
+  { errorContext = "expected a step name (identifier) to start a step instruction"; }
+  nameTok = <ID>
+
+  { errorContext = "expected ':' after step name '" + nameTok.image + "'"; }
+  <COLON>
+
+  { errorContext = "expected keyword 'if' in step '" + nameTok.image + "'"; }
+  <IF>
+
+  { errorContext = "expected a condition of the form ID<NUM after 'if' in step '" + nameTok.image + "'"; }
+  conditionTok = condition(stepObj)
+
+  { errorContext = "expected '(' to open parameter list in step '" + nameTok.image + "'"; }
+  <LPAREN>
+
+  { errorContext = "expected first parameter name in step '" + nameTok.image + "'"; }
+  id1Tok = <ID>
+
+  { errorContext = "expected ',' between parameter names in step '" + nameTok.image + "'"; }
+  <COMMA>
+
+  { errorContext = "expected second parameter name in step '" + nameTok.image + "'"; }
+  id2Tok = <ID>
+
+  { errorContext = "expected ')' after parameter names in step '" + nameTok.image + "'"; }
+  <RPAREN>
+
+  { errorContext = "expected body of step '" + nameTok.image + "'"; }
+  body(stepObj)
+
+  {
+    stepObj.stepName = nameTok.image;
+    stepObj.id1 = id1Tok.image;
+    stepObj.id2 = id2Tok.image;
+    // FC8: no two steps may have the same name
+    if (stepNames.containsKey(nameTok.image)) {
+      fail(nameTok.beginLine, "Step with name '" + nameTok.image + "' is already defined.");
+    }
+    stepNames.put(nameTok.image, nameTok);
+
+    // FC6: ID1 and ID2 must be different within each step
+    if (id1Tok.image.equals(id2Tok.image)) {
+      fail(id1Tok.beginLine, "Parameter names in step '" + nameTok.image + "' must be different. Both are '" + id1Tok.image + "'.");
+    }
+
+    // COND identifier must be ID1 or ID2
+    if (!conditionTok.image.equals(id1Tok.image) && !conditionTok.image.equals(id2Tok.image)) {
+      fail(conditionTok.beginLine, "Condition variable '" + conditionTok.image + "' in step '" + nameTok.image
+           + "' must be one of the parameter names '" + id1Tok.image + "' or '" + id2Tok.image + "'.");
+    }
+
+    // FC5: record param names for global check
+    if (!parameterNames.containsKey(id1Tok.image)) {
+        parameterNames.put(id1Tok.image, id1Tok);
+    }
+    if (!parameterNames.containsKey(id2Tok.image)) {
+        parameterNames.put(id2Tok.image, id2Tok);
+    }
+
+    stepMemory.put(stepObj.stepName, stepObj);
+  }
+}
+
+// condition - parses the threshold check and returns the ID token for validation
+// ID "<" NUM
+Token condition(StepData stepObj) : { Token conditionTok; Token condNumTok; }
+{
+  { errorContext = "condition must be of the form ID<NUM"; }
+  conditionTok = <ID>
+
+  { errorContext = "expected '<' after identifier '" + conditionTok.image + "' in condition"; }
+  <LT>
+
+  { errorContext = "expected a numeral after '<' in condition"; }
+  condNumTok = <NUM>
+  {
+    stepObj.conditionVariable = conditionTok.image;
+    stepObj.conditionThreshold = Long.parseLong(condNumTok.image);
+    return conditionTok;
+  }
+}
+
+// body - handles all three short format
+// Proper format: becomes (E1,E2) and NSTEP else (E3,E4) and ESTEP
+//   Short A: NSTEP else (E3,E4) and ESTEP (no becomes clause)
+//   Short B: becomes (E1,E2) and NSTEP else ESTEP (no else coords)
+//   Short C: NSTEP else ESTEP (neither clause)
+void body(StepData stepObj) : { Token nstepTok, estepTok; Expr e1 = null, e2 = null, e3 = null, e4 = null; }
+{
+   // true branch coordinate update
+  ( LOOKAHEAD(<BECOMES>)
+    <BECOMES>
+    { errorContext = "expected '(' after 'becomes'"; }
+    <LPAREN>
+    { errorContext = "expected expression after '(' in becomes clause"; }
+    e1=expr()
+    { errorContext = "expected ',' between expressions in becomes clause"; }
+    <COMMA>
+    e2=expr()
+    { errorContext = "expected ')' to close becomes clause"; }
+    <RPAREN>
+    { errorContext = "expected 'and' after becomes clause"; }
+    <AND>
+  )?
+
+  { errorContext = "expected true-branch step name"; }
+  nstepTok = <ID>
+  <ELSE>
+
+  // false branch coordinate update
+  ( LOOKAHEAD(<LPAREN>)
+    <LPAREN>
+    { errorContext = "expected expression after '(' in else branch"; }
+    e3=expr()
+    { errorContext = "expected ',' between expressions in else branch"; }
+    <COMMA>
+    e4=expr()
+    { errorContext = "expected ')' to close else branch coordinates"; }
+    <RPAREN>
+    { errorContext = "expected 'and' after else branch coordinates"; }
+    <AND>
+  )?
+
+  { errorContext = "expected a step name for the false branch"; }
+  estepTok = <ID>
+  {
+    stepObj.e1 = e1;
+    stepObj.e2 = e2;
+    stepObj.e3 = e3;
+    stepObj.e4 = e4;
+    stepObj.NSTEP = nstepTok.image;
+    stepObj.ESTEP = estepTok.image;
+
+    // Track step references for FC5 validation
+    stepReferences.add(nstepTok);
+    stepReferences.add(estepTok);
+  }
+}
+
+
+// expr - handles Addition (+) and Subtraction (-)
+Expr expr() :{ Expr left, right; Token opTok;}
+{
+  left = term()
+  (
+    ( opTok=<PLUS> | opTok=<MINUS>)
+    { errorContext = "expected a term after '" + opTok.image + "'"; }
+    right = term()
+    { left = new BinOpExpr(opTok.image.charAt(0), left, right); }
+  )*
+  { return left; }
+}
+
+
+// term - handles multiplication (*)
+Expr term() : { Expr left, right;}
+{
+  left = factor()
+  (
+    <TIMES>
+    { errorContext = "expected a factor after '*'"; }
+    right = factor()
+    { left = new BinOpExpr('*', left, right); }
+  )*
+  { return left; }
+}
+
+// factor - base mathematics unit like a numeral, an identifier, or a parenthesised expression
+Expr factor() : { Token tok; Expr exp; }
+{
+    tok = <NUM>
+    { return new NumExpr(Long.parseLong(tok.image)); }
+
+  | tok = <ID>
+    { return new VarExpr(tok.image); }
+
+  | <LPAREN>
+    { errorContext = "expected an expression after '('"; }
+    exp = expr()
+
+    { errorContext = "expected ')' to close parenthesised expression"; }
+    <RPAREN>
+    { return exp; }
+}
